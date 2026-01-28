@@ -231,96 +231,7 @@ def get_low_cpu_instances(session, region):
         
     return findings
 
-def get_ec2_rightsizing(session, region):
-    """
-    Identify EC2 instances with LOW Max CPU (< 30%).
-    Recommend downsizing (e.g. T-series or smaller size).
-    """
-    ec2 = session.client('ec2', region_name=region)
-    cloudwatch = session.client('cloudwatch', region_name=region)
-    findings = []
-    
-    try:
-        instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
-        instance_list = []
-        instance_details = {}
 
-        for reservation in instances['Reservations']:
-            for inst in reservation['Instances']:
-                inst_id = inst['InstanceId']
-                instance_list.append(inst_id)
-                instance_details[inst_id] = {
-                    'LaunchTime': inst['LaunchTime'],
-                    'Type': inst['InstanceType']
-                }
-        
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=7)
-        
-        for inst_id in instance_list:
-            # We want MAXIMUM CPU this time
-            metrics = cloudwatch.get_metric_statistics(
-                Namespace='AWS/EC2',
-                MetricName='CPUUtilization',
-                Dimensions=[{'Name': 'InstanceId', 'Value': inst_id}],
-                StartTime=start_time,
-                EndTime=end_time,
-                Period=86400,
-                Statistics=['Maximum']
-            )
-            
-            datapoints = metrics.get('Datapoints', [])
-            if datapoints:
-                max_cpu = max([d['Maximum'] for d in datapoints])
-                # If Max CPU is low, we can resize
-                if max_cpu < 30.0:
-                    current_type = instance_details[inst_id]['Type']
-                    # Conservative savings estimate: 50% of current cost (assuming 1 size down)
-                    # We'll use a placeholder cost calc since we don't have a pricing API
-                    est_savings = EST_COST_IDLE_EC2 * 0.5 
-                    
-                    findings.append({
-                        'Resource Type': 'EC2 Instance',
-                        'ID': inst_id,
-                        'Details': f"Max CPU (7d): {max_cpu:.2f}%. Current: {current_type}. Recommend Rightsizing.",
-                        'Estimated Monthly Savings ($)': est_savings,
-                        'Creation Date': instance_details[inst_id].get('LaunchTime'),
-                        'Type': 'Rightsizing'
-                    })
-
-    except ClientError:
-        pass
-        
-    return findings
-
-def get_ebs_modernization(session, region):
-    """
-    Identify 'gp2' volumes that can be upgraded to 'gp3' (usually cheaper & better).
-    """
-    ec2 = session.client('ec2', region_name=region)
-    findings = []
-    
-    try:
-        # Find gp2 volumes
-        volumes = ec2.describe_volumes(Filters=[{'Name': 'volume-type', 'Values': ['gp2']}])['Volumes']
-        for vol in volumes:
-            size = vol['Size']
-            # gp2 price ~0.10/GB. gp3 price ~0.08/GB. Savings ~20%
-            savings = size * 0.02
-            
-            findings.append({
-                'Resource Type': 'EBS Volume',
-                'ID': vol['VolumeId'],
-                'Details': f"Type is gp2. Migrate to gp3 for ~20% savings.",
-                'Estimated Monthly Savings ($)': savings,
-                'Creation Date': vol['CreateTime'],
-                'Type': 'Rightsizing'
-            })
-            
-    except ClientError:
-        pass
-        
-    return findings
 
 def get_s3_no_lifecycle(session, region):
     """
@@ -670,6 +581,114 @@ def get_efs_no_lifecycle(session, region):
         
     return findings
 
+def get_ec2_rightsizing(session, region):
+    """
+    Identify EC2 instances with LOW Max CPU (< 30%).
+    Recommend downsizing (e.g. T-series or smaller size).
+    """
+    ec2 = session.client('ec2', region_name=region)
+    cloudwatch = session.client('cloudwatch', region_name=region)
+    findings = []
+    
+    # Simple map for downsizing
+    def get_downsize_recommendation(current_type):
+        parts = current_type.split('.')
+        if len(parts) < 2: return "generic-downsize"
+        family, size = parts[0], parts[1]
+        
+        sizes = ['nano', 'micro', 'small', 'medium', 'large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge']
+        try:
+            current_idx = sizes.index(size)
+            if current_idx > 0:
+                new_size = sizes[current_idx - 1]
+                return f"{family}.{new_size}"
+        except ValueError:
+            pass
+        return "t3.medium" # Default fallback if unknown size
+
+    try:
+        instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+        instance_list = []
+        instance_details = {}
+
+        for reservation in instances['Reservations']:
+            for inst in reservation['Instances']:
+                inst_id = inst['InstanceId']
+                instance_list.append(inst_id)
+                instance_details[inst_id] = {
+                    'LaunchTime': inst['LaunchTime'],
+                    'Type': inst['InstanceType']
+                }
+        
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=7)
+        
+        for inst_id in instance_list:
+            # We want MAXIMUM CPU this time
+            metrics = cloudwatch.get_metric_statistics(
+                Namespace='AWS/EC2',
+                MetricName='CPUUtilization',
+                Dimensions=[{'Name': 'InstanceId', 'Value': inst_id}],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=86400,
+                Statistics=['Maximum']
+            )
+            
+            datapoints = metrics.get('Datapoints', [])
+            if datapoints:
+                max_cpu = max([d['Maximum'] for d in datapoints])
+                # If Max CPU is low, we can resize
+                if max_cpu < 30.0:
+                    current_type = instance_details[inst_id]['Type']
+                    rec_type = get_downsize_recommendation(current_type)
+                    
+                    # Conservative savings estimate: 50% of current cost (assuming 1 size down)
+                    est_savings = EST_COST_IDLE_EC2 * 0.5 
+                    
+                    findings.append({
+                        'Resource Type': 'EC2 Instance',
+                        'ID': inst_id,
+                        'Details': f"Max CPU: {max_cpu:.1f}%. Current: {current_type} → Recommended: {rec_type}",
+                        'Estimated Monthly Savings ($)': est_savings,
+                        'Creation Date': instance_details[inst_id].get('LaunchTime'),
+                        'Type': 'Rightsizing'
+                    })
+
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_ebs_modernization(session, region):
+    """
+    Identify 'gp2' volumes that can be upgraded to 'gp3' (usually cheaper & better).
+    """
+    ec2 = session.client('ec2', region_name=region)
+    findings = []
+    
+    try:
+        # Find gp2 volumes
+        volumes = ec2.describe_volumes(Filters=[{'Name': 'volume-type', 'Values': ['gp2']}])['Volumes']
+        for vol in volumes:
+            size = vol['Size']
+            # gp2 price ~0.10/GB. gp3 price ~0.08/GB. Savings ~20%
+            savings = size * 0.02
+            
+            findings.append({
+                'Resource Type': 'EBS Volume',
+                'ID': vol['VolumeId'],
+                'Details': f"Current: gp2 → Recommended: gp3 (Save ~20%)",
+                'Estimated Monthly Savings ($)': savings,
+                'Creation Date': vol['CreateTime'],
+                'Type': 'Rightsizing'
+            })
+            
+    except ClientError:
+        pass
+        
+    return findings
+
 
 # --- Demo Data Generator ---
 
@@ -779,7 +798,7 @@ def generate_demo_data():
         {
             'Resource Type': 'EBS Volume',
             'ID': 'vol-oldgeneration123',
-            'Details': 'Type is gp2. Migrate to gp3 for ~20% savings.',
+            'Details': 'Current: gp2 → Recommended: gp3 (Save ~20%)',
             'Estimated Monthly Savings ($)': 20.00, # 1000GB gp2 -> gp3
             'Creation Date': now - timedelta(days=600),
             'Type': 'Rightsizing'
@@ -787,7 +806,7 @@ def generate_demo_data():
         {
             'Resource Type': 'EC2 Instance',
             'ID': 'i-overprovisioned999',
-            'Details': 'Max CPU (7d): 12.5%. Current: m5.2xlarge. Recommend Rightsizing.',
+            'Details': 'Max CPU: 12.5%. Current: m5.2xlarge → Recommended: m5.xlarge',
             'Estimated Monthly Savings ($)': 150.00,
             'Creation Date': now - timedelta(days=90),
             'Type': 'Rightsizing'
@@ -959,14 +978,21 @@ def main():
         
         st.divider()
 
-        # Export Button (Prominent)
-        csv_data = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Full Report (CSV)",
-            data=csv_data,
-            file_name=f'aws_audit_{region}_{datetime.now().strftime("%Y%m%d")}.csv',
-            mime='text/csv',
-            type="secondary"
+        # --- High Level Visuals ---
+        st.subheader("🏆 Top Savings by Service")
+        
+        # Group by Resource Type and sum savings
+        service_summary = df.groupby('Resource Type')['Estimated Monthly Savings ($)'].sum().reset_index()
+        
+        # Sort desc and just show top 5 services if there are many
+        top_services = service_summary.nlargest(5, 'Estimated Monthly Savings ($)')
+        
+        st.bar_chart(
+            data=top_services, 
+            x='Resource Type', 
+            y='Estimated Monthly Savings ($)', 
+            use_container_width=True, 
+            color='#FF4B4B'
         )
         
         st.divider()
@@ -986,51 +1012,81 @@ def main():
 
         df['Category'] = df['Resource Type'].apply(get_resource_category)
 
-        # Order we want to show categories
-        cat_order = ['Compute & Networking', 'Database', 'Storage', 'Observability', 'Other']
+        # Tabs for view separation
+        tab_cleanup, tab_rights, tab_all = st.tabs(["🗑️ Cleanup Scenarios", "📉 Rightsizing Recommendations", "📋 All Findings (Export)"])
 
-        # Loop through Categories
-        for cat in cat_order:
-            cat_df = df[df['Category'] == cat]
-            if cat_df.empty:
-                continue
+        # --- Helper: Render Groups ---
+        def render_grouped_dataframe(dataframe, mode='standard'):
+            cat_order = ['Compute & Networking', 'Database', 'Storage', 'Observability', 'Other']
+            has_data = False
             
-            # Category Header
-            st.markdown(f"#### 🔹 {cat}")
-            
-            # Loop through Resource Types in this Category
-            # Sort by savings desc
-            res_summary = cat_df.groupby('Resource Type')['Estimated Monthly Savings ($)'].sum().sort_values(ascending=False)
-            
-            for r_type in res_summary.index:
-                subset = cat_df[cat_df['Resource Type'] == r_type]
-                total_r_savings = res_summary[r_type]
-                count = len(subset)
-
-                # Expander Title
-                expander_label = f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"
+            for cat in cat_order:
+                cat_df = dataframe[dataframe['Category'] == cat]
+                if cat_df.empty:
+                    continue
                 
-                with st.expander(expander_label):
-                    # Clean Table
-                    display_cols = ['ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']
-                    valid_cols = [c for c in display_cols if c in subset.columns]
+                has_data = True
+                st.markdown(f"#### 🔹 {cat}")
+                
+                # Sort by savings desc
+                res_summary = cat_df.groupby('Resource Type')['Estimated Monthly Savings ($)'].sum().sort_values(ascending=False)
+                
+                for r_type in res_summary.index:
+                    subset = cat_df[cat_df['Resource Type'] == r_type]
+                    total_r_savings = res_summary[r_type]
+                    count = len(subset)
                     
-                    st.dataframe(
-                        subset[valid_cols],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Details": st.column_config.TextColumn(
-                                "Details",
-                                help="Specific finding details",
-                                width="medium"
-                            ),
-                            "Estimated Monthly Savings ($)": st.column_config.NumberColumn(
-                                "Est. Savings ($)",
-                                format="$%.2f"
+                    
+                    with st.expander(f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"):
+                        # Column Config based on mode
+                        if mode == 'rightsizing':
+                            # Try to extract details if they exist in 'Details' string or assume they are added
+                            # For now, we rely on the message in 'Details'
+                            st.dataframe(
+                                subset[['ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Details": st.column_config.TextColumn("Recommendation", width="large"),
+                                    "Estimated Monthly Savings ($)": st.column_config.NumberColumn("Est. Savings ($)", format="$%.2f")
+                                }
                             )
-                        }
-                    )
+                        else:
+                            st.dataframe(
+                                subset[['ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Details": st.column_config.TextColumn("Details", width="medium"),
+                                    "Estimated Monthly Savings ($)": st.column_config.NumberColumn("Est. Savings ($)", format="$%.2f")
+                                }
+                            )
+
+            if not has_data:
+                st.info("No findings in this category.")
+
+        with tab_cleanup:
+            st.caption("Resources that appear unused or orphaned and can likely be deleted.")
+            cleanup_df = df[df['Type'] == 'Cleanup']
+            render_grouped_dataframe(cleanup_df, mode='cleanup')
+
+        with tab_rights:
+            st.caption("Resources that are over-provisioned and can be sized down.")
+            rightsize_df = df[df['Type'] == 'Rightsizing']
+            render_grouped_dataframe(rightsize_df, mode='rightsizing')
+
+        with tab_all:
+            st.caption("Full list of all findings for audit purposes.")
+            # Export Button (Prominent in All tab)
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Full Report (CSV)",
+                data=csv_data,
+                file_name=f'aws_audit_{region}_{datetime.now().strftime("%Y%m%d")}.csv',
+                mime='text/csv',
+                type="primary"
+            )
+            render_grouped_dataframe(df, mode='all')
 
 if __name__ == "__main__":
     main()
