@@ -798,179 +798,239 @@ def generate_demo_data():
 # --- Main Application ---
 
 def main():
-    # Sidebar
-    st.sidebar.title("AWS Audit Config")
+    # --- State Management ---
+    if 'data_snapshot' not in st.session_state:
+        st.session_state.data_snapshot = None
+    if 'audit_run' not in st.session_state:
+        st.session_state.audit_run = False
     
-    # Common AWS Regions (shortlisted for UI)
+    # Defaults for config
+    if 'selected_region' not in st.session_state:
+        st.session_state.selected_region = "us-east-1"
+    if 'use_demo_mode' not in st.session_state:
+        st.session_state.use_demo_mode = False
+
     available_regions = [
         "us-east-1", "us-east-2", "us-west-1", "us-west-2",
         "eu-west-1", "eu-central-1", "ap-southeast-1", "ap-southeast-2",
         "ap-northeast-1", "sa-east-1"
     ]
-    selected_region = st.sidebar.selectbox("Select Target Region", available_regions)
-    
-    use_demo_mode = st.sidebar.checkbox("Enable Demo Mode", help="Simulate findings without AWS credentials.")
-    
-    run_audit = st.sidebar.button("Run Audit")
-    
-    st.sidebar.markdown("---")
-    
-    with st.sidebar.expander("ℹ️ How to Use"):
-        st.markdown(
-            """
-            1. **Select Region**: Choose the AWS region you want to audit.
-            2. **Run Audit**: Click the button to start scanning.
-            3. **Review Findings**:
-                - Check the **Executive Summary** for potential savings.
-                - Explore detailed tables in the **Tabs**.
-            4. **Download**: Get a CSV report of all findings.
-            
-            **Note**: This tool requires local AWS credentials with `ReadOnlyAccess`. 
-            If you don't have credentials, enable **Demo Mode** to test the UI.
-            """
-        )
 
-    # Main Header
-    st.title(f"{PAGE_ICON} AWS Cost Optimization Dashboard")
-    st.markdown(f"**Target Region:** `{selected_region}`")
-    
-    if use_demo_mode:
-        st.warning("⚠️ Running in DEMO MODE. Displayed data is simulated.")
-    else:
-        st.info("This tool scans your AWS environment for orphaned resources, unused compute, and storage waste. It assumes local credentials.")
+    # --- Landing Page Logic ---
+    if not st.session_state.audit_run:
+        # Centered Landing Layout
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.title(f"{PAGE_ICON} AWS Cost Optimiser")
+            st.markdown(
+                """
+                <div style='text-align: center; margin-bottom: 20px;'>
+                Welcome! This tool scans your AWS environment to identify
+                <b>orphaned resources</b>, <b>idle compute</b>, and <b>storage waste</b>.
+                </div>
+                """, unsafe_allow_html=True
+            )
 
-    if run_audit:
-        with st.spinner(f"Scanning resources in {selected_region}..."):
-            try:
-                all_findings = []
-
-                if use_demo_mode:
-                    # Use Demo Data
-                    all_findings = generate_demo_data()
-                else:
-                    # Real AWS Scan
-                    session = get_session(selected_region)
-                    # Test connection (simple call)
-                    session.client('sts').get_caller_identity()
-                    
-                    # Run Scans (CLEANUP)
-                    all_findings.extend(get_orphaned_resources(session, selected_region))
-                    all_findings.extend(get_old_snapshots(session, selected_region))
-                    all_findings.extend(get_low_cpu_instances(session, selected_region))
-                    all_findings.extend(get_s3_no_lifecycle(session, selected_region))
-                    all_findings.extend(get_idle_rds(session, selected_region))
-                    all_findings.extend(get_idle_sagemaker(session, selected_region))
-                    all_findings.extend(get_idle_elasticache(session, selected_region))
-                    all_findings.extend(get_unused_dynamodb(session, selected_region))
-                    all_findings.extend(get_zombie_elbs(session, selected_region))
-                    all_findings.extend(get_expensive_logs(session, selected_region))
-                    all_findings.extend(get_idle_nat_gateways(session, selected_region))
-                    all_findings.extend(get_ecr_no_lifecycle(session, selected_region))
-                    all_findings.extend(get_efs_no_lifecycle(session, selected_region))
-                    
-                    # Run Scans (RIGHTSIZING)
-                    all_findings.extend(get_ec2_rightsizing(session, selected_region))
-                    all_findings.extend(get_ebs_modernization(session, selected_region))
+            # Configuration Form
+            with st.container(border=True):
+                st.subheader("⚙️ Configuration")
                 
-                # --- Results Display ---
+                region_input = st.selectbox(
+                    "Select Target Region", 
+                    available_regions, 
+                    index=available_regions.index(st.session_state.selected_region) if st.session_state.selected_region in available_regions else 0
+                )
                 
-                if not all_findings:
-                    st.success("No resource waste found! Your environment looks clean.")
-                else:
-                    df = pd.DataFrame(all_findings)
-                    
-                    # Ensure Type column exists (for safety)
-                    if 'Type' not in df.columns:
-                        df['Type'] = 'Cleanup'
+                demo_input = st.checkbox(
+                    "Enable Demo Mode", 
+                    value=st.session_state.use_demo_mode,
+                    help="Simulate findings without AWS credentials."
+                )
 
-                    # Executive Summary
-                    total_savings = df['Estimated Monthly Savings ($)'].sum()
-                    cleanup_savings = df[df['Type'] == 'Cleanup']['Estimated Monthly Savings ($)'].sum()
-                    rightsizing_savings = df[df['Type'] == 'Rightsizing']['Estimated Monthly Savings ($)'].sum()
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Est. Savings", f"${total_savings:,.2f}")
-                    col2.metric("🗑️ Cleanup Savings", f"${cleanup_savings:,.2f}")
-                    col3.metric("📉 Rightsizing Savings", f"${rightsizing_savings:,.2f}")
-                    
-                    st.divider()
-
-                    # Charts
-                    st.subheader("💰 Potential Savings Breakdown")
-                    
-                    # 1. Savings by Resource Type (Bar Chart)
-                    savings_by_type = df.groupby("Resource Type")["Estimated Monthly Savings ($)"].sum().sort_values(ascending=False)
-                    st.bar_chart(savings_by_type)
-                    
-                    st.divider()
-                    
-                    # --- Categorization Logic ---
-                    def get_resource_category(resource_type):
-                        if resource_type in ['EC2 Instance', 'Elastic IP', 'Load Balancer (ELBv2)', 'NAT Gateway', 'SageMaker Notebook']:
-                            return 'Compute & Networking'
-                        elif resource_type in ['EBS Volume', 'EBS Snapshot', 'S3 Bucket', 'EFS File System', 'ECR Repository']:
-                            return 'Storage'
-                        elif resource_type in ['RDS Instance', 'DynamoDB Table', 'Elasticache Cluster']:
-                            return 'Database'
-                        elif resource_type == 'CloudWatch Log Group':
-                            return 'Observability'
-                        return 'Other'
-
-                    df['Category'] = df['Resource Type'].apply(get_resource_category)
-
-                    def render_grouped_dataframe(dataframe):
-                        """Helper to display dataframe grouped by Category."""
-                        # Order we want to show categories
-                        cat_order = ['Compute & Networking', 'Database', 'Storage', 'Observability', 'Other']
-                        
-                        has_data = False
-                        for cat in cat_order:
-                            subset = dataframe[dataframe['Category'] == cat]
-                            if not subset.empty:
-                                has_data = True
-                                st.markdown(f"#### 🔹 {cat}")
-                                # Columns to show
-                                cols = ['Resource Type', 'ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']
-                                # Only show columns that exist (e.g. Type might be useful in 'All' view)
-                                final_cols = [c for c in cols if c in dataframe.columns]
-                                if 'Type' in dataframe.columns and 'Type' not in final_cols:
-                                     final_cols.append('Type')
-                                     
-                                st.dataframe(subset[final_cols], use_container_width=True)
-                        
-                        if not has_data:
-                            st.info("No findings in this category.")
-
-                    # Main Tabs
-                    tab_cleanup, tab_rightsize, tab_all = st.tabs(["🗑️ Cleanup Opportunities", "📉 Rightsizing & Modernization", "📋 All Findings"])
-                    
-                    with tab_cleanup:
-                        st.markdown("### Resources to Delete/Terminate")
-                        cleanup_df = df[df['Type'] == 'Cleanup']
-                        render_grouped_dataframe(cleanup_df)
-
-                    with tab_rightsize:
-                        st.markdown("### Resources to Modify/Rightsize")
-                        rightsize_df = df[df['Type'] == 'Rightsizing']
-                        render_grouped_dataframe(rightsize_df)
-
-                    with tab_all:
-                        st.markdown("### All Findings")
-                        render_grouped_dataframe(df)
-
-                    # Download Report
-                    csv = df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="Download Report as CSV",
-                        data=csv,
-                        file_name='aws_audit_report.csv',
-                        mime='text/csv',
+                st.markdown("---")
+                # AWS Configure Instructions
+                with st.expander("ℹ️ Prerequisites"):
+                    st.markdown(
+                        """
+                        Ensure you have the **AWS CLI** installed and configured locally:
+                        ```bash
+                        aws configure
+                        ```
+                        [👉 Official Setup Guide](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html)
+                        """
                     )
+                
+                # Big Run Button
+                if st.button("🚀 Run Cloud Audit", use_container_width=True, type="primary"):
+                    st.session_state.selected_region = region_input
+                    st.session_state.use_demo_mode = demo_input
+                    st.session_state.audit_run = True
+                    st.rerun()
 
-            except (NoCredentialsError, PartialCredentialsError):
-                st.error("AWS Credentials not found. Please configure them using `aws configure`.")
-            except Exception as e:
-                st.error(f"An unexpected error occurred: {e}")
+    # --- Results Page Logic ---
+    else:
+        # Retrieve config from session state
+        region = st.session_state.selected_region
+        demo_mode = st.session_state.use_demo_mode
+
+        # Header with Back Button context
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.title(f"{PAGE_ICON} Audit Results: {region}")
+        with c2:
+            if st.button("🔄 New Audit"):
+                st.session_state.audit_run = False
+                st.session_state.data_snapshot = None
+                st.rerun()
+        
+        # Run Logic (if no data yet)
+        if st.session_state.data_snapshot is None:
+            with st.spinner(f"Scanning resources in {region}..."):
+                try:
+                    all_findings = []
+                    if demo_mode:
+                        all_findings = generate_demo_data()
+                    else:
+                        # Real AWS Scan
+                        session = get_session(region)
+                        session.client('sts').get_caller_identity() # Test Auth
+                        
+                        # Cleanup Scans
+                        scan_funcs_cleanup = [
+                            get_orphaned_resources, get_old_snapshots, get_low_cpu_instances,
+                            get_s3_no_lifecycle, get_idle_rds, get_idle_sagemaker,
+                            get_idle_elasticache, get_unused_dynamodb, get_zombie_elbs,
+                            get_expensive_logs, get_idle_nat_gateways, get_ecr_no_lifecycle,
+                            get_efs_no_lifecycle
+                        ]
+                        for func in scan_funcs_cleanup:
+                            all_findings.extend(func(session, region))
+                        
+                        # Rightsizing Scans
+                        scan_funcs_rightsize = [get_ec2_rightsizing, get_ebs_modernization]
+                        for func in scan_funcs_rightsize:
+                            all_findings.extend(func(session, region))
+
+                    st.session_state.data_snapshot = all_findings
+                
+                except (NoCredentialsError, PartialCredentialsError):
+                    st.error("❌ AWS Credentials not found.")
+                    st.markdown("""
+                        Please configure them locally using:
+                        ```bash
+                        aws configure
+                        ```
+                        Or enable **Demo Mode** to test without credentials.
+                    """)
+                    if st.button("Back to Config"):
+                        st.session_state.audit_run = False
+                        st.rerun()
+                    st.stop()
+                except Exception as e:
+                    st.error(f"❌ An error occurred: {e}")
+                    if st.button("Back to Config"):
+                        st.session_state.audit_run = False
+                        st.rerun()
+                    st.stop()
+        
+        # Display Results
+        findings = st.session_state.data_snapshot
+        
+        if not findings:
+            st.success("🎉 No resource waste found! Your environment looks clean.")
+            return
+
+        df = pd.DataFrame(findings)
+        
+        # Ensure standard cols
+        if 'Type' not in df.columns: df['Type'] = 'Cleanup'
+
+        # Metrics
+        total_savings = df['Estimated Monthly Savings ($)'].sum()
+        cleanup_savings = df[df['Type'] == 'Cleanup']['Estimated Monthly Savings ($)'].sum()
+        rightsize_savings = df[df['Type'] == 'Rightsizing']['Estimated Monthly Savings ($)'].sum()
+        
+        # Top Recommendations Summary
+        st.markdown("### 📊 Executive Summary")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Potential Savings", f"${total_savings:,.2f}", delta_color="inverse")
+        m2.metric("Cleanup Opportunities", f"${cleanup_savings:,.2f}")
+        m3.metric("Rightsizing Opportunities", f"${rightsize_savings:,.2f}")
+        
+        st.divider()
+
+        # Export Button (Prominent)
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Full Report (CSV)",
+            data=csv_data,
+            file_name=f'aws_audit_{region}_{datetime.now().strftime("%Y%m%d")}.csv',
+            mime='text/csv',
+            type="secondary"
+        )
+        
+        st.divider()
+        st.subheader("🔍 Detailed Findings")
+
+        # --- Categorization Logic ---
+        def get_resource_category(resource_type):
+            if resource_type in ['EC2 Instance', 'Elastic IP', 'Load Balancer (ELBv2)', 'NAT Gateway', 'SageMaker Notebook']:
+                return 'Compute & Networking'
+            elif resource_type in ['EBS Volume', 'EBS Snapshot', 'S3 Bucket', 'EFS File System', 'ECR Repository']:
+                return 'Storage'
+            elif resource_type in ['RDS Instance', 'DynamoDB Table', 'Elasticache Cluster']:
+                return 'Database'
+            elif resource_type == 'CloudWatch Log Group':
+                return 'Observability'
+            return 'Other'
+
+        df['Category'] = df['Resource Type'].apply(get_resource_category)
+
+        # Order we want to show categories
+        cat_order = ['Compute & Networking', 'Database', 'Storage', 'Observability', 'Other']
+
+        # Loop through Categories
+        for cat in cat_order:
+            cat_df = df[df['Category'] == cat]
+            if cat_df.empty:
+                continue
+            
+            # Category Header
+            st.markdown(f"#### 🔹 {cat}")
+            
+            # Loop through Resource Types in this Category
+            # Sort by savings desc
+            res_summary = cat_df.groupby('Resource Type')['Estimated Monthly Savings ($)'].sum().sort_values(ascending=False)
+            
+            for r_type in res_summary.index:
+                subset = cat_df[cat_df['Resource Type'] == r_type]
+                total_r_savings = res_summary[r_type]
+                count = len(subset)
+
+                # Expander Title
+                expander_label = f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"
+                
+                with st.expander(expander_label):
+                    # Clean Table
+                    display_cols = ['ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']
+                    valid_cols = [c for c in display_cols if c in subset.columns]
+                    
+                    st.dataframe(
+                        subset[valid_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Details": st.column_config.TextColumn(
+                                "Details",
+                                help="Specific finding details",
+                                width="medium"
+                            ),
+                            "Estimated Monthly Savings ($)": st.column_config.NumberColumn(
+                                "Est. Savings ($)",
+                                format="$%.2f"
+                            )
+                        }
+                    )
 
 if __name__ == "__main__":
     main()
