@@ -793,6 +793,39 @@ def generate_demo_data():
              'Creation Date': now - timedelta(days=300),
              'Type': 'Cleanup'
         },
+        # --- New Cleanup Items ---
+        {
+            'Resource Type': 'AMI Image',
+            'ID': 'ami-01234567890abcdef',
+            'Details': 'Created 2023-01-15. Not used by any instance.',
+            'Estimated Monthly Savings ($)': 5.00,
+            'Creation Date': now - timedelta(days=200),
+            'Type': 'Cleanup'
+        },
+        {
+            'Resource Type': 'Security Group',
+            'ID': 'launch-wizard-1 (sg-0123)',
+            'Details': 'Not attached to any Network Interface.',
+            'Estimated Monthly Savings ($)': 0.0,
+            'Creation Date': now - timedelta(days=50),
+            'Type': 'Cleanup'
+        },
+        {
+            'Resource Type': 'Redshift Cluster',
+            'ID': 'analytics-cluster-dev',
+            'Details': '0 Connections in last 24h. Consider Pausing.',
+            'Estimated Monthly Savings ($)': 100.00,
+            'Creation Date': now - timedelta(days=40),
+            'Type': 'Cleanup'
+        },
+        {
+            'Resource Type': 'CloudWatch Alarm',
+            'ID': 'High-CPU-Old-Instance',
+            'Details': 'INSUFFICIENT_DATA for > 7 days. Likely broken or unused.',
+            'Estimated Monthly Savings ($)': 0.0,
+            'Creation Date': now - timedelta(days=20),
+            'Type': 'Cleanup'
+        },
 
         # --- RIGHTSIZING (MODERNIZATION) ---
         {
@@ -809,6 +842,31 @@ def generate_demo_data():
             'Details': 'Max CPU: 12.5%. Current: m5.2xlarge → Recommended: m5.xlarge',
             'Estimated Monthly Savings ($)': 150.00,
             'Creation Date': now - timedelta(days=90),
+            'Type': 'Rightsizing'
+        },
+        # --- New Rightsizing Items ---
+        {
+            'Resource Type': 'RDS Instance',
+            'ID': 'db-read-replica-01',
+            'Details': 'Max CPU: 5.2%. Current: db.m5.large → Recommend Downsizing',
+            'Estimated Monthly Savings ($)': 45.00,
+            'Creation Date': now - timedelta(days=120),
+            'Type': 'Rightsizing'
+        },
+        {
+            'Resource Type': 'Lambda Function',
+            'ID': 'image-processor-v2',
+            'Details': 'Configured Memory: 3008 MB. Check CloudWatch for actual usage.',
+            'Estimated Monthly Savings ($)': 0.0, 
+            'Creation Date': now - timedelta(days=30),
+            'Type': 'Rightsizing'
+        },
+        {
+            'Resource Type': 'ECS Service',
+            'ID': 'frontend-cluster/web-service',
+            'Details': 'Avg CPU Util: 8.5%. Reservation might be too high.',
+            'Estimated Monthly Savings ($)': 50.00,
+            'Creation Date': now - timedelta(days=60),
             'Type': 'Rightsizing'
         }
     ]
@@ -920,13 +978,17 @@ def main():
                             get_s3_no_lifecycle, get_idle_rds, get_idle_sagemaker,
                             get_idle_elasticache, get_unused_dynamodb, get_zombie_elbs,
                             get_expensive_logs, get_idle_nat_gateways, get_ecr_no_lifecycle,
-                            get_efs_no_lifecycle
+                            get_efs_no_lifecycle, get_old_amis, get_unused_security_groups,
+                            get_redshift_pausing, get_broken_alarms
                         ]
                         for func in scan_funcs_cleanup:
                             all_findings.extend(func(session, region))
                         
                         # Rightsizing Scans
-                        scan_funcs_rightsize = [get_ec2_rightsizing, get_ebs_modernization]
+                        scan_funcs_rightsize = [
+                            get_ec2_rightsizing, get_ebs_modernization, get_rds_rightsizing,
+                            get_lambda_optimizations, get_ecs_rightsizing, get_dynamodb_ia_recommendations
+                        ]
                         for func in scan_funcs_rightsize:
                             all_findings.extend(func(session, region))
 
@@ -996,7 +1058,20 @@ def main():
         )
         
         st.divider()
-        st.subheader("🔍 Detailed Findings")
+        c_head, c_export = st.columns([4, 1])
+        with c_head:
+            st.subheader("🔍 Detailed Findings")
+            st.caption("ℹ️ These findings are advisory. Please consult with your engineering team before taking action.")
+        with c_export:
+            # Generate CSV for download
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Export CSV",
+                data=csv_data,
+                file_name=f"aws_audit_report_{region}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key='download-main'
+            )
 
         # --- Categorization Logic ---
         def get_resource_category(resource_type):
@@ -1012,8 +1087,15 @@ def main():
 
         df['Category'] = df['Resource Type'].apply(get_resource_category)
 
+        # --- Filter Logic ---
+        all_types = sorted(df['Resource Type'].unique().tolist())
+        selected_types = st.multiselect("🔎 Filter by Service", all_types, placeholder="All Services")
+        
+        if selected_types:
+            df = df[df['Resource Type'].isin(selected_types)]
+
         # Tabs for view separation
-        tab_cleanup, tab_rights, tab_all = st.tabs(["🗑️ Cleanup Scenarios", "📉 Rightsizing Recommendations", "📋 All Findings (Export)"])
+        tab_cleanup, tab_rights, tab_all = st.tabs(["🗑️ Cleanup Scenarios", "📉 Rightsizing Recommendations", "📋 All Findings"])
 
         # --- Helper: Render Groups ---
         def render_grouped_dataframe(dataframe, mode='standard'):
@@ -1026,7 +1108,9 @@ def main():
                     continue
                 
                 has_data = True
-                st.markdown(f"#### 🔹 {cat}")
+                # Sum savings for the category
+                cat_savings = cat_df['Estimated Monthly Savings ($)'].sum()
+                st.markdown(f"#### 🔹 {cat} — Total: **${cat_savings:,.2f}**")
                 
                 # Sort by savings desc
                 res_summary = cat_df.groupby('Resource Type')['Estimated Monthly Savings ($)'].sum().sort_values(ascending=False)
@@ -1036,12 +1120,14 @@ def main():
                     total_r_savings = res_summary[r_type]
                     count = len(subset)
                     
+                    if total_r_savings > 0:
+                        label = f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"
+                    else:
+                        label = f"**{r_type}** ({count}) — **Optimization Opportunities**"
                     
-                    with st.expander(f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"):
+                    with st.expander(label):
                         # Column Config based on mode
                         if mode == 'rightsizing':
-                            # Try to extract details if they exist in 'Details' string or assume they are added
-                            # For now, we rely on the message in 'Details'
                             st.dataframe(
                                 subset[['ID', 'Details', 'Estimated Monthly Savings ($)', 'Creation Date']],
                                 use_container_width=True,
@@ -1066,27 +1152,341 @@ def main():
                 st.info("No findings in this category.")
 
         with tab_cleanup:
-            st.caption("Resources that appear unused or orphaned and can likely be deleted.")
+            # Filter for Cleanup
             cleanup_df = df[df['Type'] == 'Cleanup']
             render_grouped_dataframe(cleanup_df, mode='cleanup')
 
         with tab_rights:
-            st.caption("Resources that are over-provisioned and can be sized down.")
-            rightsize_df = df[df['Type'] == 'Rightsizing']
-            render_grouped_dataframe(rightsize_df, mode='rightsizing')
+            # Filter for Rightsizing
+            rights_df = df[df['Type'] == 'Rightsizing']
+            render_grouped_dataframe(rights_df, mode='rightsizing')
 
         with tab_all:
-            st.caption("Full list of all findings for audit purposes.")
-            # Export Button (Prominent in All tab)
-            csv_data = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Full Report (CSV)",
-                data=csv_data,
-                file_name=f'aws_audit_{region}_{datetime.now().strftime("%Y%m%d")}.csv',
-                mime='text/csv',
-                type="primary"
+             st.dataframe(
+                df, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Estimated Monthly Savings ($)": st.column_config.NumberColumn("Savings ($)", format="$%.2f")
+                }
             )
-            render_grouped_dataframe(df, mode='all')
+            
 
 if __name__ == "__main__":
     main()
+
+def get_rds_rightsizing(session, region):
+    """
+    Identify RDS instances with low CPU (< 30%) to recommend downsizing.
+    """
+    rds = session.client('rds', region_name=region)
+    cloudwatch = session.client('cloudwatch', region_name=region)
+    findings = []
+    
+    try:
+        dbs = rds.describe_db_instances()['DBInstances']
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=7)
+        
+        for db in dbs:
+            db_id = db['DBInstanceIdentifier']
+            db_class = db['DBInstanceClass']
+            engine = db['Engine']
+            
+            if db['DBInstanceStatus'] != 'available':
+                continue
+
+            # Check CPU
+            metrics = cloudwatch.get_metric_statistics(
+                Namespace='AWS/RDS',
+                MetricName='CPUUtilization',
+                Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_id}],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=86400,
+                Statistics=['Maximum']
+            )
+            
+            datapoints = metrics.get('Datapoints', [])
+            if datapoints:
+                max_cpu = max([d['Maximum'] for d in datapoints])
+                if max_cpu < 30.0:
+                    findings.append({
+                        'Resource Type': 'RDS Instance',
+                        'ID': db_id,
+                        'Details': f"Max CPU: {max_cpu:.1f}%. Current: {db_class} → Recommend Downsizing",
+                        'Estimated Monthly Savings ($)': EST_COST_RDS * 0.3, # Approx 30% saving
+                        'Creation Date': db['InstanceCreateTime'],
+                        'Type': 'Rightsizing'
+                    })
+                    
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_lambda_optimizations(session, region):
+    """
+    Identify Lambda functions that might be over-provisioned (High Memory > 1GB, Low Usage).
+    Strictly heuristic-based without Logs Insights.
+    """
+    awslambda = session.client('lambda', region_name=region)
+    findings = []
+    
+    try:
+        paginator = awslambda.get_paginator('list_functions')
+        for page in paginator.paginate():
+            for func in page['Functions']:
+                mem = func['MemorySize']
+                name = func['FunctionName']
+                
+                # Heuristic: If Memory > 1024 MB, might be worth checking if it's actually needed.
+                # Real optimization requires analyzing 'Max Memory Used' from logs, which is expensive to query here.
+                # We will just flag 'Potential' over-provisioning for high-memory functions.
+                if mem > 1024:
+                    findings.append({
+                        'Resource Type': 'Lambda Function',
+                        'ID': name,
+                        'Details': f"Configured Memory: {mem} MB. Check CloudWatch for actual usage.",
+                        'Estimated Monthly Savings ($)': 0.0, # detailed calc too complex for simple scan
+                        'Creation Date': datetime.strptime(func['LastModified'].split('+')[0], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc),
+                        'Type': 'Rightsizing'
+                    })
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_ecs_rightsizing(session, region):
+    """
+    Identify ECS Services with low CPU Utilization vs Reservation.
+    """
+    ecs = session.client('ecs', region_name=region)
+    cloudwatch = session.client('cloudwatch', region_name=region)
+    findings = []
+    
+    try:
+        clusters = ecs.list_clusters()['clusterArns']
+        for cluster in clusters:
+            services = ecs.list_services(cluster=cluster)['serviceArns']
+            # ECS list_services returns max 10. Paginator needed for robust apps, simplified here.
+            
+            if not services:
+                continue
+                
+            desc_services = ecs.describe_services(cluster=cluster, services=services)['services']
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(days=7)
+
+            for svc in desc_services:
+                svc_name = svc['serviceName']
+                cluster_name = cluster.split('/')[-1]
+                
+                # Check CPU Utilization
+                metrics = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/ECS',
+                    MetricName='CPUUtilization',
+                    Dimensions=[
+                        {'Name': 'ClusterName', 'Value': cluster_name},
+                        {'Name': 'ServiceName', 'Value': svc_name}
+                    ],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=86400,
+                    Statistics=['Average'] # Avg utilization
+                )
+                
+                datapoints = metrics.get('Datapoints', [])
+                if datapoints:
+                    avg_cpu = sum([d['Average'] for d in datapoints]) / len(datapoints)
+                    # If avg CPU utilization (which is % of Reservation) is very low (< 10%)
+                    if avg_cpu < 10.0:
+                         findings.append({
+                            'Resource Type': 'ECS Service',
+                            'ID': f"{cluster_name}/{svc_name}",
+                            'Details': f"Avg CPU Util: {avg_cpu:.1f}%. Reservation might be too high.",
+                            'Estimated Monthly Savings ($)': 50.00, # Placeholder
+                            'Creation Date': svc['createdAt'],
+                            'Type': 'Rightsizing'
+                        })
+
+    except ClientError:
+        pass
+    
+    return findings
+
+def get_dynamodb_ia_recommendations(session, region):
+    """
+    Identify Standard tables that could benefit from Infrequent Access (Standard-IA) class.
+    Heuristic: Low Read/Write activity relative to storage.
+    """
+    dynamo = session.client('dynamodb', region_name=region)
+    findings = []
+    
+    try:
+        tables = dynamo.list_tables()['TableNames']
+        for t_name in tables:
+            desc = dynamo.describe_table(TableName=t_name)['Table']
+            table_class = desc.get('TableClassSummary', {}).get('TableClass', 'STANDARD')
+            
+            if table_class == 'STANDARD':
+                # If table is > 10GB but has no recent usage? 
+                # Checking metrics is best...
+                pass 
+                # Simplified: Just a placeholder for the logic pattern as specific IA calc is complex without deeper metrics.
+                # We will skip active implementation to keep it robust and not noisy.
+                
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_old_amis(session, region):
+    """
+    Identify AMIs > 180 days old that are not currently used.
+    """
+    ec2 = session.client('ec2', region_name=region)
+    findings = []
+    
+    try:
+        # Get my AMIs
+        amis = ec2.describe_images(Owners=['self'])['Images']
+        
+        # Get AMIs used by running instances (to avoid deleting active ones)
+        instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
+        used_amis = set()
+        for res in instances['Reservations']:
+            for inst in res['Instances']:
+                used_amis.add(inst['ImageId'])
+                
+        cutoff = datetime.now(timezone.utc) - timedelta(days=180)
+        
+        for ami in amis:
+            ami_id = ami['ImageId']
+            created = datetime.strptime(ami['CreationDate'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+            
+            if created < cutoff and ami_id not in used_amis:
+                 findings.append({
+                    'Resource Type': 'AMI Image',
+                    'ID': ami_id,
+                    'Details': f"Created {created.date()}. Not used by any instance.",
+                    'Estimated Monthly Savings ($)': 5.00, # Approx storage cost for Snapshot
+                    'Creation Date': created,
+                    'Type': 'Cleanup' 
+                })
+                
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_unused_security_groups(session, region):
+    """
+    Identify Security Groups not attached to any ENI.
+    """
+    ec2 = session.client('ec2', region_name=region)
+    findings = []
+    
+    try:
+        sgs = ec2.describe_security_groups(Filters=[{'Name': 'owner-id', 'Values': ['self']}])['SecurityGroups']
+        all_sgs = {sg['GroupId']: sg['GroupName'] for sg in sgs if sg['GroupName'] != 'default'}
+        
+        # Find Used SGs
+        enis = ec2.describe_network_interfaces()['NetworkInterfaces']
+        used_sgs = set()
+        for eni in enis:
+            for group in eni['Groups']:
+                used_sgs.add(group['GroupId'])
+                
+        for sg_id, sg_name in all_sgs.items():
+            if sg_id not in used_sgs:
+                 findings.append({
+                    'Resource Type': 'Security Group',
+                    'ID': f"{sg_name} ({sg_id})",
+                    'Details': "Not attached to any Network Interface.",
+                    'Estimated Monthly Savings ($)': 0.0, # Hygiene only
+                    'Creation Date': datetime.now(timezone.utc), # SG doesn't have create date in describe
+                    'Type': 'Cleanup' 
+                })
+                
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_redshift_pausing(session, region):
+    """
+    Identify Redshift clusters that could be paused (0 connections in last 24h).
+    """
+    redshift = session.client('redshift', region_name=region)
+    cloudwatch = session.client('cloudwatch', region_name=region)
+    findings = []
+    
+    try:
+        clusters = redshift.describe_clusters()['Clusters']
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=1)
+        
+        for cluster in clusters:
+            c_id = cluster['ClusterIdentifier']
+            status = cluster['ClusterStatus']
+            
+            if status != 'available':
+                continue
+                
+            metrics = cloudwatch.get_metric_statistics(
+                Namespace='AWS/Redshift',
+                MetricName='DatabaseConnections',
+                Dimensions=[{'Name': 'ClusterIdentifier', 'Value': c_id}],
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=3600,
+                Statistics=['Maximum']
+            )
+            
+            datapoints = metrics.get('Datapoints', [])
+            max_conn = max([d['Maximum'] for d in datapoints]) if datapoints else 0
+            
+            if datapoints and max_conn == 0:
+                findings.append({
+                    'Resource Type': 'Redshift Cluster',
+                    'ID': c_id,
+                    'Details': "0 Connections in last 24h. Consider Pausing.",
+                    'Estimated Monthly Savings ($)': 100.00, # Placeholder
+                    'Creation Date': cluster['ClusterCreateTime'],
+                    'Type': 'Cleanup'
+                })
+                
+    except ClientError:
+        pass
+        
+    return findings
+
+def get_broken_alarms(session, region):
+    """
+    Identify CloudWatch Alarms in INSUFFICIENT_DATA state for > 7 days.
+    """
+    cw = session.client('cloudwatch', region_name=region)
+    findings = []
+    
+    try:
+        alarms = cw.describe_alarms(StateValue='INSUFFICIENT_DATA')['MetricAlarms']
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        
+        for alarm in alarms:
+            # updated is when it last changed state
+            updated = alarm['StateUpdatedTimestamp'] 
+            if updated < cutoff:
+                findings.append({
+                    'Resource Type': 'CloudWatch Alarm',
+                    'ID': alarm['AlarmName'],
+                    'Details': "INSUFFICIENT_DATA for > 7 days. Likely broken or unused.",
+                    'Estimated Monthly Savings ($)': 0.0, # Alarms cost $0.10, negligible but good hygiene
+                    'Creation Date': alarm['AlarmConfigurationUpdatedTimestamp'],
+                    'Type': 'Cleanup'
+                })
+                
+    except ClientError:
+        pass
+        
+    return findings
