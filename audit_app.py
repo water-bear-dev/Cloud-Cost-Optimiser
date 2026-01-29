@@ -944,12 +944,22 @@ def generate_pdf_report(df, company_name, logo_url):
     top_findings = df.sort_values(by='Estimated Monthly Savings ($)', ascending=False).head(10)
     
     for index, row in top_findings.iterrows():
-        pdf.cell(40, 10, str(row['Resource Type'])[:20], 1)
-        pdf.cell(30, 10, str(row.get('Effort', 'N/A')), 1)
-        pdf.cell(80, 10, str(row['Details'])[:40], 1)
+        # Sanitize text for PDF (Latin-1)
+        r_type = str(row['Resource Type']).replace('→', '->')[:20]
+        effort = str(row.get('Effort', 'N/A')).replace('→', '->')
+        details = str(row['Details']).replace('→', '->')[:40]
+        
+        # Safe encode/decode to remove any other incompatible chars
+        r_type = r_type.encode('latin-1', 'ignore').decode('latin-1')
+        effort = effort.encode('latin-1', 'ignore').decode('latin-1')
+        details = details.encode('latin-1', 'ignore').decode('latin-1')
+
+        pdf.cell(40, 10, r_type, 1)
+        pdf.cell(30, 10, effort, 1)
+        pdf.cell(80, 10, details, 1)
         pdf.cell(40, 10, f"${row['Estimated Monthly Savings ($)']:,.2f}", 1, 1, 'R')
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 # --- Main Application ---
 
@@ -1049,17 +1059,20 @@ def main():
             
             # PDF Download
             if st.session_state.data_snapshot:
-                pdf_bytes = generate_pdf_report(
-                    pd.DataFrame(st.session_state.data_snapshot),
-                    st.session_state.company_name,
-                    st.session_state.logo_url
-                )
-                st.download_button(
-                    label="📄 Download PDF Report",
-                    data=pdf_bytes,
-                    file_name="cloud_audit_report.pdf",
-                    mime="application/pdf"
-                )
+                try:
+                    pdf_bytes = generate_pdf_report(
+                        pd.DataFrame(st.session_state.data_snapshot),
+                        st.session_state.company_name,
+                        st.session_state.logo_url
+                    )
+                    st.download_button(
+                        label="📄 Download PDF Report",
+                        data=pdf_bytes,
+                        file_name="cloud_audit_report.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Failed to generate PDF: {e}")
 
         # Retrieve config from session state
         region = st.session_state.selected_region
