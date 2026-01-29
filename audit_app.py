@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from fpdf import FPDF
 
 # --- Constants & Configuration ---
 PAGE_TITLE = "AWS Cost Optimization Auditor"
@@ -870,7 +871,85 @@ def generate_demo_data():
             'Type': 'Rightsizing'
         }
     ]
+    
+    # Assign Effort Ratings for Consulting View
+    for f in findings:
+        if 'Effort' not in f:
+            if f['Type'] == 'Cleanup':
+                 f['Effort'] = 'Low'
+            else:
+                 f['Effort'] = 'Medium'
+                 
+            # Overrides for complex tasks
+            if 'DynamoDB' in f['Resource Type']:
+                f['Effort'] = 'High'
+            if 'Redshift' in f['Resource Type']:
+                 f['Effort'] = 'High'
+            if 'Graviton' in str(f.get('Details', '')):
+                 f['Effort'] = 'High'
+
     return findings
+
+# --- PDF Report Generator ---
+def generate_pdf_report(df, company_name, logo_url):
+    class PDF(FPDF):
+        def header(self):
+            if logo_url:
+                try:
+                    self.image(logo_url, 10, 8, 33)
+                    self.set_xy(50, 10)
+                except:
+                    pass # Fallback if logo url invalid
+            else:
+                 self.set_xy(10, 10)
+            
+            self.set_font('Arial', 'B', 15)
+            self.cell(0, 10, f'{company_name} - Cloud Cost Audit', 0, 1, 'L')
+            self.ln(10)
+
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Arial', 'I', 8)
+            self.cell(0, 10, f'Page {self.page_no()}/{{nb}}', 0, 0, 'C')
+
+    pdf = PDF()
+    pdf.alias_nb_pages()
+    pdf.add_page()
+    pdf.set_font('Arial', '', 12)
+    
+    # Executive Summary
+    total_savings = df['Estimated Monthly Savings ($)'].sum()
+    annual_savings = total_savings * 12
+    count = len(df)
+    
+    pdf.set_font('Arial', 'B', 14)
+    pdf.cell(0, 10, 'Executive Summary', 0, 1)
+    pdf.set_font('Arial', '', 12)
+    pdf.multi_cell(0, 10, f"We have identified {count} optimization opportunities with a potential annual saving of ${annual_savings:,.2f}.\nActing on these findings will reduce your monthly AWS bill by ${total_savings:,.2f}.")
+    pdf.ln(10)
+    
+    # Top Opportunities
+    pdf.set_font('Arial', 'B', 14)
+    pdf.cell(0, 10, 'Top Optimization Opportunities', 0, 1)
+    pdf.set_font('Arial', '', 10)
+    
+    # Table Header
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(40, 10, 'Service', 1, 0, 'C', 1)
+    pdf.cell(30, 10, 'Effort', 1, 0, 'C', 1)
+    pdf.cell(80, 10, 'Issue', 1, 0, 'C', 1)
+    pdf.cell(40, 10, 'Monthly Savings', 1, 1, 'C', 1)
+    
+    # Table Rows (Top 10)
+    top_findings = df.sort_values(by='Estimated Monthly Savings ($)', ascending=False).head(10)
+    
+    for index, row in top_findings.iterrows():
+        pdf.cell(40, 10, str(row['Resource Type'])[:20], 1)
+        pdf.cell(30, 10, str(row.get('Effort', 'N/A')), 1)
+        pdf.cell(80, 10, str(row['Details'])[:40], 1)
+        pdf.cell(40, 10, f"${row['Estimated Monthly Savings ($)']:,.2f}", 1, 1, 'R')
+
+    return pdf.output(dest='S').encode('latin-1')
 
 # --- Main Application ---
 
@@ -886,19 +965,36 @@ def main():
         st.session_state.selected_region = "us-east-1"
     if 'use_demo_mode' not in st.session_state:
         st.session_state.use_demo_mode = False
+    if 'company_name' not in st.session_state:
+        st.session_state.company_name = "Cloud Cost Optimiser"
+    if 'logo_url' not in st.session_state:
+        st.session_state.logo_url = ""
 
     available_regions = [
         "us-east-1", "us-east-2", "us-west-1", "us-west-2",
         "eu-west-1", "eu-central-1", "ap-southeast-1", "ap-southeast-2",
         "ap-northeast-1", "sa-east-1"
     ]
+    
+
+
+    # --- Helper: Render Header ---
+    def render_header(title_suffix=""):
+        col1, col2 = st.columns([1, 4])
+        with col1:
+             if st.session_state.logo_url:
+                 st.image(st.session_state.logo_url, width=80)
+             else:
+                 st.write(f"<h1>{PAGE_ICON}</h1>", unsafe_allow_html=True)
+        with col2:
+             st.title(f"{st.session_state.company_name} {title_suffix}")
 
     # --- Landing Page Logic ---
     if not st.session_state.audit_run:
         # Centered Landing Layout
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.title(f"{PAGE_ICON} AWS Cost Optimiser")
+            render_header()
             st.markdown(
                 """
                 <div style='text-align: center; margin-bottom: 20px;'>
@@ -946,6 +1042,25 @@ def main():
 
     # --- Results Page Logic ---
     else:
+        # --- Sidebar Config (Whitelabeling) ---
+        with st.sidebar.expander("📝 Report Settings"):
+            st.session_state.company_name = st.text_input("Company Name", value=st.session_state.company_name)
+            st.session_state.logo_url = st.text_input("Logo URL (Optional)", value=st.session_state.logo_url)
+            
+            # PDF Download
+            if st.session_state.data_snapshot:
+                pdf_bytes = generate_pdf_report(
+                    pd.DataFrame(st.session_state.data_snapshot),
+                    st.session_state.company_name,
+                    st.session_state.logo_url
+                )
+                st.download_button(
+                    label="📄 Download PDF Report",
+                    data=pdf_bytes,
+                    file_name="cloud_audit_report.pdf",
+                    mime="application/pdf"
+                )
+
         # Retrieve config from session state
         region = st.session_state.selected_region
         demo_mode = st.session_state.use_demo_mode
@@ -953,7 +1068,7 @@ def main():
         # Header with Back Button context
         c1, c2 = st.columns([5, 1])
         with c1:
-            st.title(f"{PAGE_ICON} Audit Results: {region}")
+            render_header(title_suffix=f"- Audit Results: {region}")
         with c2:
             if st.button("🔄 New Audit"):
                 st.session_state.audit_run = False
@@ -1040,6 +1155,34 @@ def main():
         
         st.divider()
 
+        # --- Executive Summary ---
+        def generate_executive_summary(df):
+            total_savings = df['Estimated Monthly Savings ($)'].sum()
+            annual_savings = total_savings * 12
+            
+            # Identify top opportunities
+            if not df.empty:
+                top_findings = df.sort_values(by='Estimated Monthly Savings ($)', ascending=False).head(3)
+                services = top_findings['Resource Type'].unique()
+                services_list = list(services)
+                if len(services_list) > 1:
+                    services_str = ", ".join(services_list[:-1]) + " and " + services_list[-1]
+                else:
+                    services_str = services_list[0]
+            else:
+                services_str = "N/A"
+            
+            summary = f"""
+            #### 🚀 Executive Summary
+            We have identified **{len(df)}** optimization opportunities with a potential **annual saving of ${annual_savings:,.2f}**.
+            
+            The most significant opportunities are found in **{services_str}**. 
+            Acting on these findings will not only reduce your monthly AWS bill by **${total_savings:,.2f}** but also improve your infrastructure's security and performance posture.
+            """
+            return summary
+
+        st.info(generate_executive_summary(df))
+
         # --- High Level Visuals ---
         st.subheader("🏆 Top Savings by Service")
         
@@ -1124,6 +1267,12 @@ def main():
                         label = f"**{r_type}** ({count}) — Save **${total_r_savings:,.2f}** / month"
                     else:
                         label = f"**{r_type}** ({count}) — **Optimization Opportunities**"
+                    
+                    # Effort Badge
+                    if 'Effort' in subset.columns:
+                        effort = subset.iloc[0]['Effort']
+                        badge = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}.get(effort, "⚪")
+                        label = f"{badge} {label}"
                     
                     with st.expander(label):
                         # Column Config based on mode
